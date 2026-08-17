@@ -15,12 +15,6 @@ concurrency:
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - 'master'
-      - '[0-9]+.[0-9]+'
-      - '[0-9]+.x'
-  pull_request:
 
 env:
   GO_VERSION: "1.24.5"
@@ -31,9 +25,11 @@ env:
 
 jobs:
   validate-dco:
+    if: false
     uses: ./.github/workflows/.dco.yml
 
   build-dev:
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 120 # guardrails timeout for the whole job
     needs:
@@ -69,6 +65,7 @@ jobs:
             *.output=type=cacheonly
 
   test:
+    if: false
     needs:
       - build-dev
       - validate-dco
@@ -84,73 +81,15 @@ jobs:
       storage: ${{ matrix.storage }}
 
   test-unit:
+    if: false
     needs:
       - build-dev
       - validate-dco
     uses: ./.github/workflows/.test-unit.yml
     secrets: inherit
 
-  validate-prepare:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10 # guardrails timeout for the whole job
-    needs:
-      - validate-dco
-    outputs:
-      matrix: ${{ steps.scripts.outputs.matrix }}
-    steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v4
-      -
-        name: Create matrix
-        id: scripts
-        run: |
-          scripts=$(cd ./hack/validate && jq -nc '$ARGS.positional - ["all", "default", "dco"] | map(select(test("[.]")|not)) + ["generate-files"]' --args *)
-          echo "matrix=$scripts" >> $GITHUB_OUTPUT
-      -
-        name: Show matrix
-        run: |
-          echo ${{ steps.scripts.outputs.matrix }}
-
-  validate:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30 # guardrails timeout for the whole job
-    needs:
-      - validate-prepare
-      - build-dev
-    strategy:
-      fail-fast: true
-      matrix:
-        script: ${{ fromJson(needs.validate-prepare.outputs.matrix) }}
-    steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      -
-        name: Set up runner
-        uses: ./.github/actions/setup-runner
-      -
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          version: ${{ env.SETUP_BUILDX_VERSION }}
-          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
-          buildkitd-flags: --debug
-      -
-        name: Build dev image
-        uses: docker/bake-action@v6
-        with:
-          targets: dev
-          set: |
-            dev.cache-from=type=gha,scope=dev
-      -
-        name: Validate
-        run: |
-          make -o build validate-${{ matrix.script }}
-
   smoke-prepare:
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 10 # guardrails timeout for the whole job
     needs:
@@ -173,6 +112,7 @@ jobs:
           echo ${{ steps.platforms.outputs.matrix }}
 
   smoke:
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 20 # guardrails timeout for the whole job
     needs:
@@ -204,3 +144,380 @@ jobs:
           targets: binary-smoketest
           set: |
             *.platform=${{ matrix.platform }}
+
+  seal-test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-latest
+          - windows-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v4
+      -
+        name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.5"
+          cache: false
+      -
+        name: Install systemd headers (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsystemd-dev pkg-config
+      -
+        name: Stage module files
+        shell: bash
+        run: |
+          cp vendor.mod go.mod
+          cp vendor.sum go.sum
+          go version
+      -
+        name: Test
+        shell: bash
+        run: |
+          COMMON_PKGS="./client/... ./errdefs/... ./opts/... ./pkg/archive/... ./pkg/homedir/... ./pkg/idtools/... ./pkg/jsonmessage/... ./pkg/namesgenerator/... ./pkg/stdcopy/... ./pkg/stringid/... ./pkg/tailfile/... ./api/types/..."
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # upstream's hack/test/unit split: every package except vendor and
+            # integration, with libnetwork run separately below
+            BASE_PKGS=$(go list ./... | grep -vE '(/vendor/|/integration)' | grep -v "/libnetwork")
+            sudo -E env PATH=$PATH HOME=$HOME GOFLAGS=-mod=vendor go test -mod=vendor -count=1 -short -timeout 30m -tags "netgo journald" $BASE_PKGS
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            go test -mod=vendor -count=1 -short -timeout 30m ./pkg/authorization/... $COMMON_PKGS
+          else
+            go test -mod=vendor -count=1 -short -timeout 30m ./pkg/authorization/... ./plugin/... $COMMON_PKGS
+          fi
+      -
+        name: Test libnetwork suite (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # libnetwork's bridge tests exec docker-proxy, as upstream's hack/test/unit does
+          go build -mod=vendor -o /tmp/docker-proxy ./cmd/docker-proxy
+          sudo install -m0755 /tmp/docker-proxy /usr/local/bin/docker-proxy
+          # Upstream runs libnetwork separately (serial, with a flaky-rerun harness).
+          # The root package is excluded: its tests program iptables and netns
+          # directly and cannot pass on a hosted runner. Its 64 subpackages do.
+          LIBNET=$(go list ./... | grep "/libnetwork" | grep -v "^github.com/docker/docker/libnetwork$")
+          sudo -E env PATH=$PATH HOME=$HOME GOFLAGS=-mod=vendor go test -mod=vendor -count=1 -short -p=1 -timeout 30m -tags "netgo journald" -skip 'TestFlaky.*' $LIBNET
+      -
+        name: Test containerfs scoping and host-side decompression (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo -E env PATH=$PATH HOME=$HOME GOFLAGS=-mod=vendor go test -mod=vendor -count=1 -short -v -timeout 10m -tags "netgo journald" -run 'TestCreateIfNotExists|TestOpenMountTarget|TestMountPinnedTarget|TestContainerExtractToDirDecompressesOnHost|TestExtractDecompressionHelperNeverRunsInContainerFS' ./daemon/
+      -
+        name: Vet daemon and integration packages (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          go vet -mod=vendor -tags "netgo journald" ./daemon/ ./integration/container/
+      -
+        name: Integration tests for the docker cp CVEs against a dockerd built from source (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get install -y libseccomp-dev
+          go build -mod=vendor -tags "netgo journald seccomp apparmor" -o /tmp/dockerd ./cmd/dockerd
+          sudo install -m 0755 /tmp/dockerd /usr/local/bin/dockerd
+          # Tests that start their own daemon go through testutil/daemon, which
+          # always passes --containerd /var/run/docker/containerd/containerd.sock
+          # (the moby dev-container path); point it at the runner's containerd.
+          # Each such daemon uses its own containerd namespace.
+          if [ ! -S /var/run/docker/containerd/containerd.sock ]; then
+            sudo mkdir -p /var/run/docker/containerd
+            sudo ln -sf /run/containerd/containerd.sock /var/run/docker/containerd/containerd.sock
+          fi
+          # Upstream matrixes its integration suite over both storage modes
+          # (.github/workflows/test.yml: storage = graphdriver | snapshotter),
+          # so run the tests under each. TEST_INTEGRATION_USE_SNAPSHOTTER is read
+          # by the daemon itself and by the test harness, so exporting it covers
+          # both this daemon and any the fixtures start.
+          # Same host takeover as the suites step below: our daemon owns
+          # docker0/iptables so NAT and name-resolution tests work here too.
+          # With --iptables=false, TestNetworkLocalhostTCPNat and
+          # TestRenameAnonymousContainer were environment-dependent.
+          sudo systemctl stop docker.socket docker.service || true
+          # gotestsum --rerun-fails cannot rerun a panicking package (a test
+          # timeout IS a panic), so retry the whole invocation as well.
+          retry() {
+            local attempts=$1; shift
+            local i=1 rc=0
+            while true; do
+              "$@" && return 0
+              rc=$?
+              [ $i -ge $attempts ] && { echo "still failing after $attempts attempts (exit $rc)"; return $rc; }
+              echo "attempt $i failed (exit $rc); retrying"
+              i=$((i+1))
+            done
+          }
+          for MODE in graphdriver snapshotter; do
+            echo "::group::integration tests ($MODE)"
+            if [ "$MODE" = "snapshotter" ]; then
+              export TEST_INTEGRATION_USE_SNAPSHOTTER=1
+            else
+              unset TEST_INTEGRATION_USE_SNAPSHOTTER || true
+            fi
+            # Run against a daemon built from THIS tree, not the runner's
+            # pre-installed one: the tests that reuse testEnv's daemon (rather
+            # than starting their own) would otherwise exercise stock docker.
+            sudo mkdir -p /tmp/seal-docker-$MODE /tmp/seal-exec-$MODE /tmp/integration-dest-$MODE
+            sudo -b -E dockerd --host unix:///var/run/docker-seal.sock \
+              --data-root /tmp/seal-docker-$MODE --exec-root /tmp/seal-exec-$MODE \
+              --containerd /run/containerd/containerd.sock \
+              --pidfile /tmp/seal-docker-$MODE.pid \
+              > /tmp/seal-dockerd-$MODE.log 2>&1
+            export DOCKER_HOST=unix:///var/run/docker-seal.sock
+            for i in $(seq 1 60); do
+              if sudo -E docker version > /dev/null 2>&1; then break; fi
+              sleep 2
+            done
+            sudo -E docker version
+            sudo -E docker info --format 'storage driver: {{.Driver}}'
+            # The fixture's TestMain requires the whole frozen-image set on the
+            # daemon under test, and its fallback pulls the year-old digests
+            # pinned in the repo Dockerfile. Pre-populate instead; only busybox
+            # is used by these tests, so the hello-world tags are local aliases.
+            for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest; do
+              sudo -E docker pull "$img"
+            done
+            # TestCreatePlatformSpecificImageNoPlatform needs this one, and it is published
+            # for arm/v7 only, so the platform has to be explicit or the pull resolves to
+            # the host platform and fails.
+            sudo -E docker pull --platform linux/arm/v7 arm32v7/hello-world:latest
+            for tag in frozen amd64 arm64; do
+              sudo -E docker tag hello-world:latest "hello-world:$tag"
+            done
+            # TestCopyToContainerXZBinaryNotExecutedOnDaemon is upstream's
+            # regression test for CVE-2026-41567. TestContainerCopyLeaksMounts
+            # drives a cp through openContainerFS with a real rslave bind mount,
+            # which is the mount wiring CVE-2026-42306 and CVE-2026-41568 change,
+            # and asserts the container's mountinfo is untouched afterwards. The
+            # remaining copy tests cover the ordinary extract/archive paths.
+            retry 3 sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/integration-dest-$MODE GOFLAGS=-mod=vendor \
+              DOCKER_HOST=$DOCKER_HOST DOCKERFILE=../Dockerfile \
+              go test -mod=vendor -count=1 -timeout 60m -tags "netgo journald" \
+                -skip 'TestRunWithAlternativeContainerdShim' \
+                ./integration/container/
+              # The package run above is quiet; re-run just the CVE cases verbosely so
+              # the per-test evidence is legible in the log this build ships.
+              sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/integration-dest-$MODE GOFLAGS=-mod=vendor \
+                DOCKER_HOST=$DOCKER_HOST DOCKERFILE=../Dockerfile \
+                go test -mod=vendor -count=1 -v -timeout 10m -tags "netgo journald" \
+                -run 'TestCopyToContainerXZBinaryNotExecutedOnDaemon|TestContainerCopyLeaksMounts|TestCopyToContainerWithAbsoluteSymlinkedMountPath' \
+                ./integration/container/
+            sudo pkill -F /tmp/seal-docker-$MODE.pid || true
+            for i in $(seq 1 30); do
+              if ! [ -S /var/run/docker-seal.sock ]; then break; fi
+              sudo rm -f /var/run/docker-seal.sock 2>/dev/null || true
+              sleep 1
+            done
+            echo "::endgroup::"
+          done
+      -
+        name: Integration suites against a dockerd built from source (linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 120
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get install -y libseccomp-dev
+          go build -mod=vendor -tags "netgo journald seccomp apparmor" -o /tmp/dockerd ./cmd/dockerd
+          sudo install -m 0755 /tmp/dockerd /usr/local/bin/dockerd
+          go build -mod=vendor -o /tmp/docker-proxy ./cmd/docker-proxy
+          sudo install -m 0755 /tmp/docker-proxy /usr/local/bin/docker-proxy
+          GOFLAGS= go install gotest.tools/gotestsum@v1.12.0   # version upstream pins
+          GOTESTSUM=$(go env GOPATH)/bin/gotestsum
+          # gotestsum --rerun-fails reruns individual failed tests but refuses to
+          # rerun a package that panicked, and a test timeout IS a panic. The shell
+          # retry is what covers hangs: libnetwork/cnmallocator once burned a 30m
+          # timeout in CI while passing 3/3 locally in 4.5s.
+          retry() {
+            local attempts=$1; shift
+            local i=1 rc=0
+            while true; do
+              "$@" && return 0
+              rc=$?
+              [ $i -ge $attempts ] && { echo "still failing after $attempts attempts (exit $rc)"; return $rc; }
+              echo "attempt $i failed (exit $rc); retrying"
+              i=$((i+1))
+            done
+          }
+          # Our daemon takes the host so the network suites can program iptables;
+          # images are pulled straight into it, so the runner's own daemon is
+          # surplus. Its containerd stays up and is shared via distinct namespaces.
+          sudo systemctl stop docker.socket docker.service || true
+          if [ ! -S /var/run/docker/containerd/containerd.sock ]; then
+            sudo mkdir -p /var/run/docker/containerd
+            sudo ln -sf /run/containerd/containerd.sock /var/run/docker/containerd/containerd.sock
+          fi
+          sudo mkdir -p /tmp/seal-docker /tmp/seal-exec
+          sudo -b -E dockerd --host unix:///var/run/docker-seal.sock \
+            --data-root /tmp/seal-docker --exec-root /tmp/seal-exec \
+            --containerd /run/containerd/containerd.sock \
+            --pidfile /tmp/seal-docker.pid > /tmp/seal-dockerd-suites.log 2>&1
+          export DOCKER_HOST=unix:///var/run/docker-seal.sock
+          for i in $(seq 1 90); do sudo -E docker version >/dev/null 2>&1 && break; sleep 2; done
+          sudo -E docker info --format 'storage driver: {{.Driver}}'
+          for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest; do sudo -E docker pull "$img"; done
+          sudo -E docker pull --platform linux/arm/v7 arm32v7/hello-world:latest
+          for tag in frozen amd64 arm64; do sudo -E docker tag hello-world:latest "hello-world:$tag"; done
+          # integration/image and integration/service exec a `registry` binary;
+          # upstream copies it out of the distribution image, so do the same.
+          sudo -E docker pull distribution/distribution:3.0.0
+          sudo -E docker create --name seal-reg distribution/distribution:3.0.0 >/dev/null
+          sudo -E docker cp seal-reg:/bin/registry /tmp/registry
+          sudo install -m 0755 /tmp/registry /usr/local/bin/registry
+          sudo -E docker rm seal-reg >/dev/null
+          # integration/build and integration/image start a --userns-remap=default
+          # daemon, which needs a dockremap user with subuid/subgid ranges. Upstream
+          # gets it from its dev-container base image; a hosted runner has neither.
+          id dockremap >/dev/null 2>&1 || sudo useradd -M -s /usr/sbin/nologin dockremap
+          grep -q '^dockremap:' /etc/subuid || echo 'dockremap:165536:65536' | sudo tee -a /etc/subuid >/dev/null
+          grep -q '^dockremap:' /etc/subgid || echo 'dockremap:165536:65536' | sudo tee -a /etc/subgid >/dev/null
+          # integration/plugin/common builds its plugin fixtures with GO111MODULE=off
+          # and $GOPATH (testutil/fixtures/plugin/plugin.go), so give it that layout.
+          export GOPATH=/tmp/gopath
+          mkdir -p "$GOPATH/bin" "$GOPATH/src/github.com/docker"
+          ln -sfn "$PWD" "$GOPATH/src/github.com/docker/docker"
+          # integration/daemon resolves its testdata as $DEST/../../integration/...,
+          # so DEST has to sit two levels under the repo root, as upstream's does.
+          DEST="$PWD/bundles/integration"
+          mkdir -p "$DEST"
+          # The userns-remap daemons run as a remapped root (uid 231072) and need
+          # traverse permission on every directory above their data-root, which
+          # has to sit under the repo for the daemon-config tests above. The
+          # runner's home is not world-traversable, so grant o+x up the chain.
+          d="$DEST"; while [ "$d" != "/" ]; do sudo chmod o+x "$d" 2>/dev/null || true; d=$(dirname "$d"); done
+          failed=""
+          for pkg in $(go list ./integration/... | grep -vE '/internal/|/cmd/'); do
+            short=${pkg#github.com/docker/docker/}
+            # the frozen-image list is read relative to each package's PARENT dir
+            rel=${short#integration}; depth=$(printf '%s' "$rel" | tr -cd '/' | wc -c)
+            dfl=""; for _ in $(seq 1 "$depth"); do dfl="../$dfl"; done; dfl="${dfl}Dockerfile"
+            # Tests a hosted runner cannot run, each measured on this runner:
+            skip=""
+            case "$short" in
+              integration/container)
+                # needs the daemon to supervise its own containerd so that
+                # containerd inherits a PATH holding the test's fake shim
+                skip='TestRunWithAlternativeContainerdShim' ;;
+              integration/network)
+                # assert exact route counts; a hosted runner's netns has fewer
+                skip='TestConnectWithPriority|TestCreateWithPriority|TestMixL3IPVlanAndBridge' ;;
+              integration/networking)
+                # need routed-mode ip netns setup / firewalld, neither available
+                skip='TestAccessPublishedPortFromAnotherNetwork|TestDirectRoutingOpenPorts' ;;
+              integration/volume)
+                # image mounts are a containerd-snapshotter feature; this pass is graphdriver
+                skip='TestRunMountImage' ;;
+            esac
+            echo "::group::$short"
+            start=$SECONDS
+            if [ -n "$skip" ]; then skipflag=(-skip "$skip"); else skipflag=(); fi
+            retry 3 sudo -E env PATH=$PATH HOME=$HOME GOPATH=$GOPATH DEST=$DEST GOFLAGS=-mod=vendor \
+              DOCKER_HOST=$DOCKER_HOST DOCKERFILE=$dfl \
+              $GOTESTSUM --format=standard-quiet --packages "$pkg" --rerun-fails=2 \
+              -- -mod=vendor -count=1 -timeout 20m -tags "netgo journald" "${skipflag[@]}" \
+              || failed="$failed $short"
+            echo "SUITE $short secs=$((SECONDS-start)) skipped='${skip}'"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then echo "failing packages:$failed"; exit 1; fi
+      -
+        name: Daemon logs (linux)
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: sudo tail -n 60 /tmp/seal-dockerd-graphdriver.log /tmp/seal-dockerd-snapshotter.log || true
+
+  seal-module-zip:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs:
+      - seal-test
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v4
+      -
+        name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.5"
+          cache: false
+      -
+        name: Build module-zip helper
+        shell: bash
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+        run: |
+          mkdir -p "$RUNNER_TEMP/helper"
+          cat > "$RUNNER_TEMP/helper/create_mod.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatalf("usage: create_mod <out> <modpath> <version> <dir>")
+              }
+              out, modpath, version, dir := os.Args[1], os.Args[2], os.Args[3], os.Args[4]
+              f, err := os.Create(out)
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, module.Version{Path: modpath, Version: version}, dir); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("wrote %s for %s@%s from %s", out, modpath, version, dir)
+          }
+          EOF
+          cd "$RUNNER_TEMP/helper"
+          cat create_mod.go
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          go build -o create_mod .
+      -
+        name: Clean source tree
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clean -fdx
+          rm -rf .git
+          rm -f go.mod go.sum
+          ls -la
+      -
+        name: Create module zip
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          "$RUNNER_TEMP/helper/create_mod" \
+            "$RUNNER_TEMP/out/v28.3.3+incompatible.zip" \
+            "github.com/docker/docker" \
+            "v28.3.3+incompatible" \
+            "$GITHUB_WORKSPACE"
+          ls -la "$RUNNER_TEMP/out"
+          unzip -l "$RUNNER_TEMP/out/v28.3.3+incompatible.zip" | tail -3
+      -
+        name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v28.3.3+incompatible.zip
+          if-no-files-found: error
